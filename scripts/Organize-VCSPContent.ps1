@@ -1,35 +1,102 @@
-#requires -Version 5.1
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
-    [string]$SourceRoot = 'E:\',
-    [string]$ContentRoot = 'E:\ContentLibrary',
-    [string]$AppPoolName = 'vCenter-Content-Library'
+    [Parameter(Position = 0)]
+    [ValidateNotNullOrEmpty()]
+    [string]$SourcePath = 'E:\',
+
+    [Parameter(Position = 1)]
+    [string]$DestinationRoot = 'E:\ContentLibrary',
+
+    [ValidateSet('iso', 'ova')]
+    [string[]]$Extensions = @('iso', 'ova')
 )
+
 $ErrorActionPreference = 'Stop'
-$source = Get-Item -LiteralPath $SourceRoot
-$destination = Get-Item -LiteralPath $ContentRoot
-if (-not $source.PSIsContainer -or -not $destination.PSIsContainer -or $source.FullName.TrimEnd('\') -eq $destination.FullName.TrimEnd('\')) { throw 'Source and destination must be different existing directories.' }
-if (($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($destination.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Source/destination links are not supported.' }
-$files = @(Get-ChildItem -LiteralPath $source.FullName -File | Where-Object { $_.Extension -in '.iso','.ova' })
-foreach ($file in $files) {
-    if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "File links are not supported: $file" }
-    $folder = Join-Path $destination.FullName $file.BaseName
-    if (($files | Where-Object { $_.BaseName -eq $file.BaseName }).Count -gt 1 -or (Test-Path -LiteralPath $folder)) {
-        Write-Warning "Skipping collision/existing folder: $($file.Name)"
-        continue
+Set-StrictMode -Version Latest
+
+function Get-SafeFolderName {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $invalidCharacters = [System.IO.Path]::GetInvalidFileNameChars()
+    $escapedCharacters = [regex]::Escape((-join $invalidCharacters))
+    $safeName = $Name -replace "[$escapedCharacters]", '_'
+    $safeName = $safeName.Trim().TrimEnd('.')
+
+    if ([string]::IsNullOrWhiteSpace($safeName)) {
+        throw "The filename '$Name' does not produce a valid folder name."
     }
-    if ($PSCmdlet.ShouldProcess($file.FullName, "Move to $folder and grant the IIS pool read access")) {
-        # Refuse a file held open by a copier. The caller must still ensure copying is complete.
-        $handle = [IO.File]::Open($file.FullName, 'Open', 'Read', 'None')
-        $handle.Dispose()
-        New-Item -ItemType Directory -Path $folder | Out-Null
-        $target = Join-Path $folder ($file.BaseName + $file.Extension.ToLowerInvariant())
-        Move-Item -LiteralPath $file.FullName -Destination $target -ErrorAction Stop
-        # Same-volume moves can preserve the source ACL. Explicitly allow IIS reads.
-        $acl = Get-Acl -LiteralPath $target
-        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("IIS AppPool\$AppPoolName", 'ReadAndExecute', 'Allow')))
-        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')), 'FullControl', 'Allow')))
-        Set-Acl -LiteralPath $target -AclObject $acl
-        Write-Output $target
+
+    return $safeName
+}
+
+$resolvedSource = (Resolve-Path -LiteralPath $SourcePath -ErrorAction Stop).Path
+if (-not (Test-Path -LiteralPath $resolvedSource -PathType Container)) {
+    throw "Source path '$resolvedSource' is not a directory."
+}
+
+if ([string]::IsNullOrWhiteSpace($DestinationRoot)) {
+    $resolvedDestination = $resolvedSource
+}
+else {
+    if (-not (Test-Path -LiteralPath $DestinationRoot -PathType Container)) {
+        if ($PSCmdlet.ShouldProcess($DestinationRoot, 'Create destination root directory')) {
+            New-Item -ItemType Directory -Path $DestinationRoot -Force | Out-Null
+        }
+    }
+
+    if (Test-Path -LiteralPath $DestinationRoot -PathType Container) {
+        $resolvedDestination = (Resolve-Path -LiteralPath $DestinationRoot).Path
+    }
+    else {
+        # With -WhatIf, the destination is intentionally not created.
+        $resolvedDestination = [System.IO.Path]::GetFullPath($DestinationRoot)
     }
 }
+
+$normalizedExtensions = $Extensions | ForEach-Object { "." + $_.TrimStart('.').ToLowerInvariant() }
+$sourceFiles = Get-ChildItem -LiteralPath $resolvedSource -File |
+    Where-Object { $normalizedExtensions -contains $_.Extension.ToLowerInvariant() } |
+    Sort-Object Name
+
+if (-not $sourceFiles) {
+    Write-Warning "No matching ISO or OVA files were found directly in '$resolvedSource'."
+    return
+}
+
+$results = foreach ($file in $sourceFiles) {
+    $folderName = Get-SafeFolderName -Name $file.BaseName
+    $itemDirectory = Join-Path $resolvedDestination $folderName
+    $destinationFile = Join-Path $itemDirectory $file.Name
+
+    if (Test-Path -LiteralPath $destinationFile) {
+        Write-Warning "Skipped '$($file.FullName)' because '$destinationFile' already exists."
+        [pscustomobject]@{
+            Source      = $file.FullName
+            ItemFolder  = $itemDirectory
+            Destination = $destinationFile
+            Status      = 'Skipped - destination exists'
+        }
+        continue
+    }
+
+    if ($PSCmdlet.ShouldProcess($itemDirectory, "Create item directory for '$($file.Name)'")) {
+        New-Item -ItemType Directory -Path $itemDirectory -Force | Out-Null
+    }
+
+    if ($PSCmdlet.ShouldProcess($file.FullName, "Move to '$destinationFile'")) {
+        Move-Item -LiteralPath $file.FullName -Destination $destinationFile
+        $status = 'Moved'
+    }
+    else {
+        $status = 'WhatIf'
+    }
+
+    [pscustomobject]@{
+        Source      = $file.FullName
+        ItemFolder  = $itemDirectory
+        Destination = $destinationFile
+        Status      = $status
+    }
+}
+
+$results

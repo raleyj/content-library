@@ -1,58 +1,93 @@
 # Windows-hosted vCenter Content Library
 
-A Windows Server / IIS publisher for a **subscribed vCenter Content Library**, using a static VCSP catalog instead of iSCSI or SMB storage.
+These are the five PowerShell scripts Justin used for his Windows Server Content Library deployment—not the reconstructed scripts previously uploaded here. Original behavior is preserved; the internal hostname in two scripts is replaced with `library.example.com`. See [VALIDATION.md](VALIDATION.md) for scope and [KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) before running.
 
-Read the [deployment blog](BLOG.md) for the walkthrough and the troubleshooting lessons from the lab.
+## Scripts
 
-## Included files
+| Script | Purpose |
+| --- | --- |
+| [Install-vCenterContentLibraryPublisher.ps1](scripts/Install-vCenterContentLibraryPublisher.ps1) | Install IIS and create the HTTPS publisher using an existing or self-signed certificate. |
+| [Install-VCSPCatalogAutomation.ps1](scripts/Install-VCSPCatalogAutomation.ps1) | Discover/install Python, install dependencies, generate the runner, and register the two-hour SYSTEM task. |
+| [Repair-VCSPPublisherAccess.ps1](scripts/Repair-VCSPPublisherAccess.ps1) | Configure anonymous authentication to use the actual application pool and grant read access. |
+| [Organize-VCSPContent.ps1](scripts/Organize-VCSPContent.ps1) | Move top-level ISO/OVA files into folders named after their base names. |
+| [Enable-VCSPHttp.ps1](scripts/Enable-VCSPHttp.ps1) | Add HTTP access while retaining HTTPS. |
 
-- `scripts/Configure-VCSPWeb.ps1`: configure IIS, an existing certificate, anonymous read access, optional browsing and HTTP.
-- `scripts/Install-VCSPCatalogAutomation.ps1`: create a Python virtual environment, install dependencies, and schedule catalog generation every two hours.
-- `scripts/Run-VCSPCatalog.ps1`: generate the catalog with logging.
-- `scripts/Organize-VCSPContent.ps1`: move completed ISO/OVA files from `E:\` into individual folders under `E:\ContentLibrary`.
-- `make_vcsp_2022.py`: unchanged, pinned upstream generator. See [third-party notices](THIRD_PARTY_NOTICES.md).
+The automation installer generates `C:\ProgramData\VCSPCatalog\Scripts\Run-VCSPCatalog.ps1`. Do not use the previous standalone runner/config.json workflow.
 
-## Quick start
+## Deployment order for a new server
 
-Use an elevated **Windows PowerShell 5.1** prompt on the Windows Server. Review scripts first. Replace the hostname, certificate thumbprint and network scope below.
+Use elevated **Windows PowerShell 5.1** on Windows Server. Prepare DNS, routing, disk capacity, and an existing certificate in `Cert:\LocalMachine\My` with its private key, matching SAN, and trusted issuing CA.
 
-Install a supported 64-bit Python runtime from [python.org](https://www.python.org/downloads/windows/) for all users. The original lab used Python 3.12.10; that is historical information, not a recommendation to install an old patch release. These scripts accept an explicit interpreter path and deliberately do not silently download an old runtime.
+The installers retain their original **D:** defaults; the other scripts use **E:**. Pass the paths explicitly as below. Review the warnings before running. These commands configure the server; they are not a dry run.
 
 ```powershell
 Set-Location C:\Setup\content-library
 
-.\scripts\Configure-VCSPWeb.ps1 `
+.\scripts\Install-vCenterContentLibraryPublisher.ps1 `
     -PublisherFqdn 'library.example.com' `
-    -CertificateThumbprint 'REPLACE_WITH_EXISTING_CERTIFICATE_THUMBPRINT' `
-    -AllowedRemoteAddress 'LocalSubnet' `
-    -EnableDirectoryBrowsing
+    -ContentRoot 'E:\ContentLibrary' `
+    -CertificateThumbprint 'REPLACE_WITH_YOUR_CERTIFICATE_THUMBPRINT'
 
 .\scripts\Install-VCSPCatalogAutomation.ps1 `
     -LibraryName 'Published Content Library' `
-    -PythonPath 'C:\Program Files\Python312\python.exe' `
-    -RunImmediately
+    -ContentRoot 'E:\ContentLibrary' `
+    -StagingRoot 'E:\ContentLibrary-Staging'
 
-# Copy complete ISO/OVA files to E:\ first. Preview before moving them.
-.\scripts\Organize-VCSPContent.ps1 -WhatIf
-.\scripts\Organize-VCSPContent.ps1
+.\scripts\Repair-VCSPPublisherAccess.ps1 `
+    -ContentRoot 'E:\ContentLibrary'
+
+# Copy COMPLETE files to E:\ first. Use distinct base names and lowercase extensions.
+.\scripts\Organize-VCSPContent.ps1 `
+    -SourcePath 'E:\' -DestinationRoot 'E:\ContentLibrary' -WhatIf
+
+.\scripts\Organize-VCSPContent.ps1 `
+    -SourcePath 'E:\' -DestinationRoot 'E:\ContentLibrary'
 
 Start-ScheduledTask -TaskName 'Regenerate vCenter VCSP Catalog'
 Get-ScheduledTaskInfo -TaskName 'Regenerate vCenter VCSP Catalog'
+Get-ChildItem C:\ProgramData\VCSPCatalog\Logs
 Invoke-WebRequest 'https://library.example.com/lib.json' -UseBasicParsing
 ```
 
-Create a **Subscribed Content Library** in vCenter using `https://library.example.com/lib.json`. Choose the vCenter datastore and download policy, then synchronize and test one item. A successful HTTP response alone does not validate vCenter synchronization.
+The publisher creates nested `_staging`; run automation second so it relocates that folder outside the web root. If the destination staging directory already exists, automation stops for manual reconciliation. Never scan incomplete uploads. The task begins approximately two minutes after registration; wait for it to finish before starting another run.
 
-`LocalSubnet` is the Windows Firewall scope, not every network in your lab. Supply the required management/client CIDRs or IP addresses if vCenter or clients are elsewhere. Ensure DNS and routing work from those networks.
+Create a **Subscribed Content Library** in vCenter with `https://library.example.com/lib.json`, select its datastore/download policy, then synchronize and verify an actual item. Windows hosts the publisher; it is not an iSCSI target or the subscribed library's datastore.
 
-## Optional HTTP access
+## Optional directory browsing
 
-Rerun `Configure-VCSPWeb.ps1` with the same settings and `-EnableHttp`. Existing HTTPS bindings are retained. HTTP is unencrypted; keep the vCenter subscription on HTTPS and use HTTP only on trusted networks. See the blog for redirect and Require SSL troubleshooting.
+This was a separate configuration step in the lab and is not enabled by the five original scripts:
 
-## Safety and validation
+```powershell
+Install-WindowsFeature Web-Dir-Browsing
+Import-Module WebAdministration
+Set-WebConfigurationProperty `
+    -PSPath 'MACHINE/WEBROOT/APPHOST' `
+    -Location 'vCenter-Content-Library' `
+    -Filter 'system.webServer/directoryBrowse' `
+    -Name enabled -Value $true
+```
 
-This is a reconstructed, reviewed lab bundle, not a production-tested installer. See [VALIDATION.md](VALIDATION.md) for the exact checks performed. Back up IIS configuration and existing catalogs before changing an established deployment.
+Browse to `https://library.example.com/`. No `Restart-Website` command is needed. Browsing exposes filenames to users who can reach the anonymous website.
 
-The automation installer refuses to replace an existing installation or scheduled task. This avoids silently overwriting an earlier working deployment. Existing users should compare the scripts and migrate deliberately, not run the quick start blindly.
+## Optional HTTP
 
-Do not store upload credentials, private keys, certificate exports, logs, virtual environments, or ISO/OVA binaries in Git. Keep automation files administrator-controlled because the scheduled task runs as SYSTEM. Only the content directory is served by IIS.
+```powershell
+.\scripts\Enable-VCSPHttp.ps1 -HostName 'library.example.com'
+```
+
+HTTP is unencrypted. Keep vCenter subscribed through HTTPS. Existing Require SSL, redirects, or browser HTTPS-only settings can still prevent HTTP access. The original firewall rules are not restricted to specific remote addresses; review and scope network access yourself.
+
+## Python and scheduling
+
+- Python discovery skips Store aliases and probes real interpreters. If none qualifies, the original fallback installs **Python 3.12.10** after signature verification. This historical fallback is preserved, not recommended as the latest patched runtime. Prefer a maintained all-users installation and verify compatibility.
+- The installer downloads the upstream generator and checks its expected SHA-256. The unchanged reference copy here has the same hash; see [third-party notices](THIRD_PARTY_NOTICES.md).
+- Dependencies are installed/upgraded by the installer. `requirements.txt` documents the same version ranges but is not read by that installer.
+- Task: SYSTEM, every two hours, overlapping scheduled instances ignored, one-hour execution limit, 30-day log retention after a successful generation.
+- Rerunning automation can upgrade dependencies, overwrite its generator/runner, and replace the task. Back up before rerunning; avoid doing so during an active run.
+- Do not rerun the publisher against an existing site: it can alter prerequisites before rejecting the existing site.
+
+## Safety
+
+Keep automation, Python, logs, and staging outside the served directory. Ensure only administrators/SYSTEM can modify the task's scripts and runtime; the original automation installer does not harden those ACLs for you. Never upload credentials, private keys, or ISO/OVA payloads to this repository.
+
+The associated article is being prepared for [JustinRaley.com](https://justinraley.com/). This README is the current script usage reference.

@@ -17,7 +17,7 @@ $source = New-Item -ItemType Directory -Path (Join-Path $testRoot 'Source')
 $dest = New-Item -ItemType Directory -Path (Join-Path $testRoot 'Content')
 # Tiny fixture only, not installation media.
 $fixture = New-Item -ItemType File -Path (Join-Path $source.FullName 'Sample.ISO')
-& (Join-Path $root 'scripts\Organize-VCSPContent.ps1') -SourceRoot $source.FullName -ContentRoot $dest.FullName -WhatIf
+& (Join-Path $root 'scripts\Organize-VCSPContent.ps1') -SourcePath $source.FullName -DestinationRoot $dest.FullName -WhatIf
 if (-not (Test-Path $fixture.FullName) -or @(Get-ChildItem $dest.FullName).Count -ne 0) { throw 'WhatIf unexpectedly changed files.' }
 Write-Output 'PASS organizer WhatIf leaves source and destination unchanged'
 # Exact fixture paths only; never recursively delete a computed directory tree.
