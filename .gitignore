@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+PythonVenv/
+Logs/
+*.log
+*.iso
+*.ova
+*.vmdk
+*.pfx
+*.p12
+*.key
+config.json
+.secrets/
